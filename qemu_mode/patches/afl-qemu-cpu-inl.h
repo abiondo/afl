@@ -7,6 +7,9 @@
 
    Idea & design very much by Andrew Griffiths.
 
+   TCG instrumentation and block chaining support by Andrea Biondo
+                                      <andrea.biondo965@gmail.com>
+
    Copyright 2015, 2016, 2017 Google Inc. All rights reserved.
 
    Licensed under the Apache License, Version 2.0 (the "License");
@@ -32,15 +35,6 @@
 /***************************
  * VARIOUS AUXILIARY STUFF *
  ***************************/
-
-/* A snippet patched into tb_find_slow to inform the parent process that
-   we have hit a new block that hasn't been translated yet, and to tell
-   it to translate within its own context, too (this avoids translation
-   overhead in the next forked-off copy). */
-
-#define AFL_QEMU_CPU_SNIPPET1 do { \
-    afl_request_tsl(pc, cs_base, flags); \
-  } while (0)
 
 /* This snippet kicks in when the instruction pointer is positioned at
    _start and does the usual forkserver stuff, not very different from
@@ -83,14 +77,24 @@ static void afl_setup(void);
 static void afl_forkserver(CPUState*);
 
 static void afl_wait_tsl(CPUState*, int);
-static void afl_request_tsl(target_ulong, target_ulong, uint64_t);
+static void afl_request_tsl(target_ulong, target_ulong, uint32_t, TranslationBlock*, int);
 
-/* Data structure passed around by the translate handlers: */
+/* Data structures passed around by the translate handlers: */
 
-struct afl_tsl {
+struct afl_tb {
   target_ulong pc;
   target_ulong cs_base;
-  uint64_t flags;
+  uint32_t flags;
+};
+
+struct afl_tsl {
+  struct afl_tb tb;
+  char is_chain;
+};
+
+struct afl_chain {
+  struct afl_tb last_tb;
+  int tb_exit;
 };
 
 /* Some forward decls: */
@@ -223,22 +227,35 @@ static void afl_forkserver(CPUState *cpu) {
 
 
 /* This code is invoked whenever QEMU decides that it doesn't have a
-   translation of a particular block and needs to compute it. When this happens,
-   we tell the parent to mirror the operation, so that the next fork() has a
-   cached copy. */
+   translation of a particular block and needs to compute it, or when it
+   decides to chain two TBs together. When this happens, we tell the parent to
+   mirror the operation, so that the next fork() has a cached copy. */
 
-static void afl_request_tsl(target_ulong pc, target_ulong cb, uint64_t flags) {
+static void afl_request_tsl(target_ulong pc, target_ulong cb, uint32_t flags,
+                            TranslationBlock *last_tb, int tb_exit) {
 
   struct afl_tsl t;
+  struct afl_chain c;
 
   if (!afl_fork_child) return;
 
-  t.pc      = pc;
-  t.cs_base = cb;
-  t.flags   = flags;
+  t.tb.pc      = pc;
+  t.tb.cs_base = cb;
+  t.tb.flags   = flags;
+  t.is_chain   = (last_tb != NULL);
 
   if (write(TSL_FD, &t, sizeof(struct afl_tsl)) != sizeof(struct afl_tsl))
     return;
+
+  if (t.is_chain) {
+    c.last_tb.pc      = last_tb->pc;
+    c.last_tb.cs_base = last_tb->cs_base;
+    c.last_tb.flags   = last_tb->flags;
+    c.tb_exit         = tb_exit;
+
+    if (write(TSL_FD, &c, sizeof(struct afl_chain)) != sizeof(struct afl_chain))
+      return;
+  }
 
 }
 
@@ -248,7 +265,8 @@ static void afl_request_tsl(target_ulong pc, target_ulong cb, uint64_t flags) {
 static void afl_wait_tsl(CPUState *cpu, int fd) {
 
   struct afl_tsl t;
-  TranslationBlock *tb;
+  struct afl_chain c;
+  TranslationBlock *tb, *last_tb;
 
   while (1) {
 
@@ -257,14 +275,29 @@ static void afl_wait_tsl(CPUState *cpu, int fd) {
     if (read(fd, &t, sizeof(struct afl_tsl)) != sizeof(struct afl_tsl))
       break;
 
-    tb = tb_htable_lookup(cpu, t.pc, t.cs_base, t.flags);
+    tb = tb_htable_lookup(cpu, t.tb.pc, t.tb.cs_base, t.tb.flags);
 
     if(!tb) {
       mmap_lock();
       tb_lock();
-      tb_gen_code(cpu, t.pc, t.cs_base, t.flags, 0);
+      tb = tb_gen_code(cpu, t.tb.pc, t.tb.cs_base, t.tb.flags, 0);
       mmap_unlock();
       tb_unlock();
+    }
+
+    if (t.is_chain) {
+      if (read(fd, &c, sizeof(struct afl_chain)) != sizeof(struct afl_chain))
+        break;
+
+      last_tb = tb_htable_lookup(cpu, c.last_tb.pc, c.last_tb.cs_base,
+                                 c.last_tb.flags);
+      if (last_tb) {
+        tb_lock();
+        if (!tb->invalid) {
+          tb_add_jump(last_tb, c.tb_exit, tb);
+        }
+        tb_unlock();
+      }
     }
 
   }

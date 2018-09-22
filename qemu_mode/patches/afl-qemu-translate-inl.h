@@ -7,7 +7,8 @@
 
    Idea & design very much by Andrew Griffiths.
 
-   TCG instrumentation by Andrea Biondo <andrea.biondo965@gmail.com>
+   TCG instrumentation and block chaining support by Andrea Biondo
+                                      <andrea.biondo965@gmail.com>
 
    Copyright 2015, 2016, 2017 Google Inc. All rights reserved.
 
